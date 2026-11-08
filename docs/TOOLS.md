@@ -1604,6 +1604,7 @@ CRM customer files (پرونده مشتری) you can access, with contact detail
 | پارامتر | نوع | لازم | توضیح |
 |---|---|---|---|
 | `search` | string (اختیاری) |  | Only customers whose name contains this text. |
+| `phone` | string (اختیاری) |  | Exact Iranian mobile number, normalized across 09 / +98 / Persian-digit formats. Returns an auditable `lookup_status`; incomplete coverage never becomes `CUSTOMER_NOT_FOUND`. |
 | `limit` | integer |  | Maximum customers to return. (پیش‌فرض: `100`) |
 
 ### mizito_get_customer
@@ -1952,4 +1953,3 @@ Call any read-only Mizito endpoint directly (get*/search*/history/info/view-styl
 | پنل پشتیبانی کارکنان میزیتو | فقط برای کارمندان شرکت میزیتو است |
 
 فهرست کامل endpointها و وضعیت هر کدام در [site-map/api.md](site-map/api.md) آمده است.
-

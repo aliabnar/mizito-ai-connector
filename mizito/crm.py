@@ -3,6 +3,7 @@ Registered only with MIZITO_ENABLE_CRM=1; the workspace plan must include CRM / 
 from __future__ import annotations
 
 from datetime import datetime
+import re
 from typing import Annotated, Literal
 
 from pydantic import Field
@@ -11,17 +12,127 @@ from mizito.app import (
     TEHRAN, WHEN_HELP, AttachmentIds, ToolError, call, chat_full, check, client, compact, html_to_text, iso, jalali,
     media_attachments, names, parse_when, send_chat, simplify_message, tool,
 )
-from mizito_client import MizitoError
+from mizito_client import MizitoAuthError, MizitoError
 
 HINT = "CRM/sales must be part of the workspace plan, and you need access to that customer file"
-CustomerChat = Annotated[str, Field(description="Customer file conversation id: mizito_list_customers or mizito_list_conversations(kind='customer').")]
+CustomerChat = Annotated[
+    str, Field(description="Customer file conversation_id (or customer_id for compatibility) from mizito_list_customers.")
+]
 
 
-def _customer(conversation_id: str) -> dict:
-    customer = chat_full(conversation_id).get("customer")
-    if not isinstance(customer, dict) or not customer.get("_id"):
-        raise ToolError("That conversation is not a customer file")
-    return customer
+_CUSTOMER_REFS = ("customer", "customer_entity", "is_customer_entity")
+_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+def _lookup_error_code(exc: Exception) -> str:
+    """Classify a customer lookup failure without echoing payload or PII."""
+    if isinstance(exc, MizitoAuthError):
+        return "CRM_CUSTOMER_LOOKUP_AUTHENTICATION_FAILED"
+    message = str(exc).casefold()
+    causes = []
+    cause = exc.__cause__
+    while cause is not None and len(causes) < 5:
+        causes.append(type(cause).__name__.casefold())
+        cause = cause.__cause__
+    if "timeout" in message or any("timeout" in name for name in causes):
+        return "CRM_CUSTOMER_LOOKUP_TIMEOUT"
+    if "http 403" in message or "forbidden" in message:
+        return "CRM_CUSTOMER_LOOKUP_AUTHORIZATION_FAILED"
+    if "http 400" in message or "http 422" in message or "validation" in message:
+        return "CRM_CUSTOMER_LOOKUP_VALIDATION_FAILED"
+    if "network error" in message or any(name.endswith("connecterror") for name in causes):
+        return "CRM_CUSTOMER_LOOKUP_TRANSPORT_FAILED"
+    return "CRM_CUSTOMER_LOOKUP_CONNECTOR_FAILED"
+
+
+def _customer_dialogs() -> list[dict]:
+    """Read and validate the customer-dialog index with stable, PII-free errors."""
+    try:
+        data = client.call("chat.getDialogs", {}) or {}
+    except MizitoError as exc:
+        raise ToolError(_lookup_error_code(exc)) from exc
+    if not isinstance(data, dict) or not isinstance(data.get("dialogs"), list):
+        raise ToolError("CRM_CUSTOMER_LOOKUP_INVALID_RESPONSE")
+    return [row for row in data["dialogs"] if isinstance(row, dict) and row.get("_id")]
+
+
+def _customer_ref(value: object) -> dict | None:
+    """Normalise the customer shapes returned by different Mizito deployments.
+
+    Older responses embed the full object in ``customer`` while newer/partial
+    dialog responses can put only the customer id in ``customer_entity`` or
+    ``is_customer_entity``.  Booleans are markers, not customer ids.
+    """
+    if isinstance(value, str) and value:
+        return {"_id": value}
+    if not isinstance(value, dict):
+        return None
+    customer_id = value.get("_id") or value.get("customer_id")
+    if isinstance(customer_id, str) and customer_id:
+        return {**value, "_id": customer_id}
+    for key in ("customer", "customer_entity"):
+        nested = _customer_ref(value.get(key))
+        if nested:
+            return nested
+    return None
+
+
+def _customer_in(*sources: dict) -> dict | None:
+    best = None
+    for source in sources:
+        for key in _CUSTOMER_REFS:
+            candidate = _customer_ref(source.get(key))
+            if candidate and (best is None or len(candidate) > len(best)):
+                best = candidate
+    return best
+
+
+def _resolve_customer(identifier: str, dialogs: list[dict] | None = None) -> tuple[dict, str]:
+    """Resolve a customer by either its conversation id or customer id.
+
+    ``mizito_list_customers`` and ``mizito_get_customer`` deliberately share
+    this resolver so the list cannot return an id which the detail tool then
+    rejects.
+    """
+    if dialogs is None:
+        dialogs = _customer_dialogs()
+    dialogs = [d for d in dialogs or [] if isinstance(d, dict) and d.get("_id")]
+
+    direct = [d for d in dialogs if d["_id"] == identifier]
+    referenced = [d for d in dialogs if (_customer_in(d) or {}).get("_id") == identifier]
+    candidates = direct + [d for d in referenced if d not in direct]
+    # When given a customer id, its reference may exist only in getFullChat.
+    # Scan customer-marked rows after the cheap dialog-row matches.
+    candidates += [d for d in dialogs if d not in candidates and d.get("is_customer_entity")]
+
+    for dialog in candidates:
+        conversation_id = dialog["_id"]
+        direct_match = (conversation_id == identifier
+                        or (_customer_in(dialog) or {}).get("_id") == identifier)
+        try:
+            full = chat_full(conversation_id)
+        except ToolError as exc:
+            if direct_match:
+                raise ToolError(_lookup_error_code(exc)) from exc
+            continue
+        if not isinstance(full, dict):
+            if direct_match:
+                raise ToolError("CRM_CUSTOMER_LOOKUP_INVALID_RESPONSE")
+            continue
+        customer = _customer_in(full, dialog)
+        if not customer:
+            continue
+        if conversation_id != identifier and customer["_id"] != identifier:
+            continue
+        if not customer.get("name"):
+            customer["name"] = full.get("title") or client.dialog_title(dialog)
+        return customer, conversation_id
+    raise ToolError("That conversation is not a customer file")
+
+
+def _customer(identifier: str) -> dict:
+    """Compatibility helper for CRM write tools that only need the customer object."""
+    return _resolve_customer(identifier)[0]
 
 
 def _customer_row(customer: dict, conversation_id: str | None = None) -> dict:
@@ -39,22 +150,149 @@ def _customer_row(customer: dict, conversation_id: str | None = None) -> dict:
     })
 
 
+def _phone_key(raw: object) -> str | None:
+    value = str(raw or "").translate(_DIGITS).strip()
+    value = re.sub(r"[\s()\-.]", "", value)
+    if value.startswith("0098"):
+        value = "0" + value[4:]
+    elif value.startswith("+98"):
+        value = "0" + value[3:]
+    elif value.startswith("98"):
+        value = "0" + value[2:]
+    elif re.fullmatch(r"9\d{9}", value):
+        value = "0" + value
+    return value if re.fullmatch(r"09\d{9}", value) else None
+
+
+def _customer_phone_keys(customer: dict) -> set[str]:
+    values = []
+    for field in ("mobile", "phone"):
+        for item in customer.get(field) or []:
+            values.append(item.get("phone_number") if isinstance(item, dict) else item)
+    return {key for key in map(_phone_key, values) if key}
+
+
+def _has_complete_phone_evidence(customer: dict | None) -> bool:
+    """Whether the dialog index contains the customer's complete phone fields.
+
+    An id-only ``customer_entity`` is not enough to prove absence: a matching
+    phone (or a duplicate customer) may be hidden in the omitted detail row.
+    Empty phone lists are complete evidence; missing phone fields are not.
+    """
+    if not isinstance(customer, dict) or not customer.get("_id"):
+        return False
+    present = False
+    for field in ("mobile", "phone"):
+        if field not in customer:
+            continue
+        present = True
+        if customer[field] is not None and not isinstance(customer[field], list):
+            return False
+    return present
+
+
+def _phone_lookup_error(code: str) -> tuple[str, str]:
+    if code == "CRM_CUSTOMER_LOOKUP_TIMEOUT":
+        return "CONNECTOR_TIMEOUT", "MIZITO_API_TIMEOUT"
+    if code == "CRM_CUSTOMER_LOOKUP_AUTHENTICATION_FAILED":
+        return "CONNECTOR_ERROR", "AUTHENTICATION_FAILED"
+    if code == "CRM_CUSTOMER_LOOKUP_AUTHORIZATION_FAILED":
+        return "CONNECTOR_ERROR", "AUTHORIZATION_FAILED"
+    if code == "CRM_CUSTOMER_LOOKUP_TRANSPORT_FAILED":
+        return "CONNECTOR_ERROR", "TRANSPORT_FAILED"
+    if code == "CRM_CUSTOMER_LOOKUP_VALIDATION_FAILED":
+        return "CONNECTOR_ERROR", "UPSTREAM_VALIDATION_FAILED"
+    if code == "CRM_CUSTOMER_LOOKUP_INVALID_RESPONSE":
+        return "CONNECTOR_ERROR", "INVALID_RESPONSE"
+    return "CONNECTOR_ERROR", "CONNECTOR_FAILED"
+
+
+def _phone_lookup_result(status: str, customers: list[dict], *, complete: bool,
+                         scanned: int = 0, incomplete: int = 0,
+                         error_code: str | None = None, limit: int = 100) -> dict:
+    return {
+        "lookup_status": status,
+        "lookup_complete": complete,
+        "lookup_method": "DIALOG_INDEX_EXACT_PHONE",
+        "request_count": 1 if scanned or status != "INVALID_PHONE" else 0,
+        "scanned_customer_count": scanned,
+        "incomplete_customer_count": incomplete,
+        "count": len(customers),
+        "truncated": len(customers) > limit,
+        "customers": customers[:limit],
+        **({"error_code": error_code} if error_code else {}),
+    }
+
+
+def _lookup_customers_by_phone(phone: object, limit: int) -> dict:
+    """Exact, bounded phone lookup using one read-only dialog-index request.
+
+    There is no verified direct phone-search endpoint in the documented Mizito
+    API.  The dialog index is therefore used only when every customer row has
+    complete phone evidence.  It never expands into per-customer full-chat
+    requests and never turns partial coverage into CUSTOMER_NOT_FOUND.
+    """
+    wanted_phone = _phone_key(phone)
+    if not wanted_phone:
+        return _phone_lookup_result("INVALID_PHONE", [], complete=False, limit=limit)
+    try:
+        dialogs = _customer_dialogs()
+    except ToolError as exc:
+        status, error_code = _phone_lookup_error(str(exc))
+        return _phone_lookup_result(status, [], complete=False,
+                                    error_code=error_code, limit=limit)
+
+    rows: list[dict] = []
+    scanned = 0
+    incomplete = 0
+    for dialog in dialogs:
+        if not dialog.get("is_customer_entity"):
+            continue
+        scanned += 1
+        customer = _customer_in(dialog)
+        if not _has_complete_phone_evidence(customer):
+            incomplete += 1
+            continue
+        if wanted_phone in _customer_phone_keys(customer):
+            rows.append(_customer_row(customer, dialog["_id"]))
+
+    if incomplete:
+        return _phone_lookup_result("LOOKUP_INCOMPLETE", rows, complete=False,
+                                    scanned=scanned, incomplete=incomplete, limit=limit)
+    status = ("CUSTOMER_NOT_FOUND" if not rows else
+              "CUSTOMER_MATCHED" if len(rows) == 1 else
+              "MULTIPLE_CUSTOMERS")
+    return _phone_lookup_result(status, rows, complete=True,
+                                scanned=scanned, limit=limit)
+
+
 @tool("فهرست پرونده‌های مشتریان", feature="crm")
 def mizito_list_customers(
     search: Annotated[str | None, Field(description="Only customers whose name contains this text.")] = None,
+    phone: Annotated[str | None, Field(description="Exact Iranian mobile number, normalized across 09 / +98 / Persian-digit formats.")] = None,
     limit: Annotated[int, Field(description="Maximum customers to return.", ge=1, le=300)] = 100,
 ) -> dict:
     """CRM customer files (پرونده مشتری) you can access, with contact details, labels and responsible
     colleagues. Each customer file is also a conversation (conversation_id) for notes, call logs and tasks."""
+    if phone is not None:
+        return _lookup_customers_by_phone(phone, limit)
     rows = []
-    for d in (client.call("chat.getDialogs", {}) or {}).get("dialogs", []):
+    dialogs = _customer_dialogs()
+    for d in dialogs or []:
+        if not isinstance(d, dict) or not d.get("_id"):
+            continue
         if not d.get("is_customer_entity"):
             continue
-        try:
-            customer = chat_full(d["_id"]).get("customer") or {}
-        except ToolError:
-            continue
-        row = _customer_row(customer, d["_id"]) if customer else {"conversation_id": d["_id"], "name": client.dialog_title(d)}
+        customer = _customer_in(d)
+        conversation_id = d["_id"]
+        # Current deployments include the customer object in each CRM dialog.
+        # Retain the detail fallback for older/partial response shapes.
+        if not customer or not customer.get("name"):
+            try:
+                customer, conversation_id = _resolve_customer(d["_id"], dialogs)
+            except ToolError:
+                continue
+        row = _customer_row(customer, conversation_id)
         if search and search not in (row.get("name") or "") and search not in (row.get("short_name") or ""):
             continue
         rows.append(row)
@@ -70,8 +308,8 @@ def mizito_get_customer(
 ) -> dict:
     """One customer file: contact details, representatives, labels, responsible colleagues, deals (open / won /
     lost with totals) and payments (received, paid, cheques, probable), plus optionally its change history."""
-    customer = _customer(conversation_id)
-    out = {"customer": _customer_row(customer, conversation_id)}
+    customer, resolved_conversation_id = _resolve_customer(conversation_id)
+    out = {"customer": _customer_row(customer, resolved_conversation_id)}
     for key, endpoint in (("deals", "deal.getCustomerDeals"), ("payments", "payment.getCustomerPayments")):
         try:
             out[key] = compact(client.call(endpoint, {"customer": customer["_id"]}) or [])
